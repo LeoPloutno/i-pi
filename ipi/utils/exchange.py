@@ -132,7 +132,23 @@ class ExchangePotential:
                 self._bead_diff_inter_first_last_bead,
             ],
         )
-
+        
+        # the quantities needed for the exact nm propagator
+        self._vspring_and_fspring_indist = depend_value(
+            name="vspring_and_fspring_indist",
+            func=self.get_vspring_and_fspring_indist,
+            dependencies=[
+                self._betaP,
+                self._omegan2,
+                self._prefix_V,
+                self._suffix_V,
+                self._bead_diff_intra,
+                self._cycle_energies,
+                self._bead_diff_inter_first_last_bead,
+                self._qbosons,
+            ],
+        )
+        
         # properties
         self._kinetic_td = depend_value(
             name="kinetic_td",
@@ -262,7 +278,16 @@ class ExchangePotential:
         RV[0] = self.prefix_V[-1]
 
         return RV
-
+    
+    def get_V_dist(self):
+        """
+        Returns the potential of distinguishable particles
+        """
+        spring_potential_prefix = 0.5 * self.boson_m * self.omegan2
+        qbosons = dstrip(self.qbosons)
+        delta = qbosons - np.roll(qbosons,shift=1,axis=0)
+        return spring_potential_prefix * np.inner(delta, delta)
+    
     def get_vspring_and_fspring(self):
         """
         Returns spring potential and forces for bosons, as a tuple (V, F).
@@ -381,7 +406,132 @@ class ExchangePotential:
         F[0, :, :] = np.einsum("ljk,jl->lk", force_from_neighbors, connection_probs)
 
         return [prefix_V[self.nbosons], F]
+    
+    def get_vspring_and_fspring_indist(self):
+        """
+        Returns only the bosonic part of the forces and potential
+        """
+        F = np.zeros((self.nbeads, self.nbosons, 3), float)
 
+        spring_force_prefix = (-1.0) * self.boson_m * self.omegan2
+        bead_diff_intra = dstrip(self.bead_diff_intra)
+        qbosons = dstrip(self.qbosons)
+        # force on intermediate beads
+        #
+        # for j in range(1, self.nbeads - 1):
+        #   for l in range(self.nbosons):
+        #         F[j, l, :] = spring_force_prefix * (-bead_diff_intra[j][l] +
+        #                                                     bead_diff_intra[j - 1][l])
+        # F[1:-1, :, :] = spring_force_prefix * (
+        #     -bead_diff_intra[1:, :] + np.roll(bead_diff_intra, axis=0, shift=1)[1:, :]
+        # )
+
+        # force on endpoint beads
+        #
+        cycle_energies = dstrip(self.cycle_energies)
+        prefix_V = dstrip(self.prefix_V)
+        suffix_V = dstrip(self.suffix_V)
+
+        connection_probs = np.zeros((self.nbosons, self.nbosons), float)
+        # close cycle probabilities:
+        # for u in range(0, self.nbosons):
+        #     for l in range(u, self.nbosons):
+        #         connection_probs[l][u] = 1 / (l + 1) * \
+        #                np.exp(- self.betaP *
+        #                        (self.prefix_V[u] + self.cycle_energies[u, l] + self.suffix_V[l+1]
+        #                         - self.prefix_V[self.nbosons]()))
+        tril_indices = np.tril_indices(self.nbosons, k=0)
+        connection_probs[tril_indices] = (
+            # np.asarray([1 / (l + 1) for l in range(self.nbosons)])[:, np.newaxis] *
+            np.reciprocal(np.arange(1.0, self.nbosons + 1))[:, np.newaxis]
+            * np.exp(
+                -self.betaP
+                * (
+                    # np.asarray([self.prefix_V(u - 1) for u in range(self.nbosons)])[np.newaxis, :]
+                    prefix_V[np.newaxis, :-1]
+                    # + np.asarray([(self.cycle_energies[u, l] if l >= u else 0) for l in range(self.nbosons)
+                    #                   for u in range(self.nbosons)]).reshape((self.nbosons, self.nbosons))
+                    + cycle_energies.T
+                    # + np.asarray([self.suffix_V(l + 1) for l in range(self.nbosons)])[:, np.newaxis]
+                    + suffix_V[1:, np.newaxis]
+                    - prefix_V[self.nbosons]
+                )
+            )
+        )[tril_indices]
+
+        # direct link probabilities:
+        # for l in range(self.nbosons - 1):
+        #     connection_probs[l][l+1] = 1 - (np.exp(- self.betaP * (self.prefix_V[l + 1] + self.suffix_V[l + 1] -
+        #                                         self.prefix_V[self.nbosons]())))
+        superdiagonal_indices = kth_diag_indices(connection_probs, k=1)
+        connection_probs[superdiagonal_indices] = 1 - (
+            np.exp(
+                -self.betaP * (prefix_V[1:-1] + suffix_V[1:-1] - prefix_V[self.nbosons])
+            )
+        )
+
+        bead_diff_inter_first_last_bead = dstrip(self.bead_diff_inter_first_last_bead)
+
+        # on the last bead:
+        #
+        # for l in range(self.nbosons):
+        #     force_from_neighbor = np.empty((self.nbosons, 3))
+        #     for next_l in range(max(l + 1, self.nbosons)):
+        #         force_from_neighbor[next_l, :] = spring_force_prefix * \
+        #                         (-self.bead_diff_inter_first_last_bead[next_l, l] + bead_diff_intra[-1, l])
+        #     F[-1, l, :] = sum(connection_probs[l][next_l] * force_from_neighbor[next_l]
+        #                       for next_l in range(self.nbosons))
+        #
+        # First vectorization:
+        # for l in range(self.nbosons):
+        #     force_from_neighbors = np.empty((self.nbosons, 3))
+        #     force_from_neighbors[:, :] = spring_force_prefix * \
+        #                         (-self.bead_diff_inter_first_last_bead[:, l] + bead_diff_intra[-1, l])
+        #     F[-1, l, :] = np.dot(connection_probs[l][:], force_from_neighbors)
+        # force_from_neighbors = spring_force_prefix * (
+        #     -np.transpose(bead_diff_inter_first_last_bead, axes=(1, 0, 2))
+        #     + bead_diff_intra[-1, :, np.newaxis]
+        # )
+        force_from_neighbors = np.zeros((self.nbosons, self.nbosons, 3))
+        for l in range(self.nbosons):
+            for j in range(self.nbosons):
+                force_from_neighbors[l, j, :] = spring_force_prefix * (
+                    qbosons[0, l, :] - qbosons[0, j, :]
+                )
+        # F[-1, l, k] = sum_{j}{force_from_neighbors[l][j][k] * connection_probs[l,j]}
+        F[-1, :, :] = np.einsum("ljk,lj->lk", force_from_neighbors, connection_probs)
+
+        # on the first bead:
+        #
+        # for l in range(self.nbosons):
+        #     force_from_neighbor = np.empty((self.nbosons, 3))
+        #     for prev_l in range(l - 1, self.nbosons):
+        #         force_from_neighbor[prev_l, :] = spring_force_prefix * \
+        #                            (-bead_diff_intra[0, l] + self.bead_diff_inter_first_last_bead[l, prev_l])
+        #     F[0, l, :] = sum(connection_probs[prev_l][l] * force_from_neighbor[prev_l]
+        #                      for prev_l in range(self.nbosons))
+        #
+        # First vectorization:
+        #
+        # for l in range(self.nbosons):
+        #     force_from_neighbors = np.empty((self.nbosons, 3))
+        #     force_from_neighbors[:, :] = spring_force_prefix * \
+        #                              (-bead_diff_intra[0, l] + self.bead_diff_inter_first_last_bead[l, :])
+        #     F[0, l, :] = np.dot(connection_probs[:, l], force_from_neighbors)
+        #
+        # force_from_neighbors = spring_force_prefix * (
+        #     bead_diff_inter_first_last_bead - bead_diff_intra[0, :, np.newaxis]
+        # )
+        for l in range(self.nbosons):
+            for j in range(self.nbosons):
+                force_from_neighbors[l, j, :] = spring_force_prefix * (
+                    qbosons[-1, l, :] - qbosons[-1, j, :]
+                )
+        # F[0, l, k] = sum_{j}{force_from_neighbors[l][j][k] * connection_probs[j,l]}
+        F[0, :, :] = np.einsum("ljk,jl->lk", force_from_neighbors, connection_probs)
+
+        return [prefix_V[self.nbosons] - self.get_V_dist(), F]
+    
     def get_distinct_probability(self):
         """
         Evaluate the probability of the configuration where all the particles are separate.
@@ -485,6 +635,7 @@ dproperties(
         "prefix_V",
         "suffix_V",
         "vspring_and_fspring",
+        "vspring_and_fspring_indist",
         "kinetic_td",
         "distinct_probability",
         "longest_probability",

@@ -793,11 +793,18 @@ class NormalModes:
             self.free_babstep()
 
         else:
+            # To be challenged
+            # if len(self.bosons) > 0:
+            #     raise NotImplementedError(
+            #         "@Normalmodes : Bosonic forces not compatible right now with the exact or Cayley propagators."
+            #     )
+            dt = self.dt #/dstrip(self.nmts)
+            
+            # propagate the momenta of the bosons only, under the influence of V_indist^[1,N]
             if len(self.bosons) > 0:
-                raise NotImplementedError(
-                    "@Normalmodes : Bosonic forces not compatible right now with the exact or Cayley propagators."
-                )
-
+                V_indist, F_indist = dstrip(self.exchange_potential.vspring_and_fspring_indist)
+                self.beads.p.reshape((self.nbeads, -1, 3))[:,self.bosons,:] += 0.5 * dt * F_indist
+            
             pq = np.zeros((2, self.natoms * 3), float)
             sm = dstrip(self.beads.sm3)
             prop_pq = dstrip(self.prop_pq)
@@ -831,6 +838,11 @@ class NormalModes:
                         pnm[k, a] = pq[0]
             self.pnm = pnm * sm
             self.qnm = qnm / sm
+            
+            # second half-step momenta propagation
+            if len(self.bosons) > 0:
+                V_indist, F_indist = dstrip(self.exchange_potential.vspring_and_fspring_indist)
+                self.beads.p.reshape((self.nbeads, -1, 3))[:,self.bosons,:] += 0.5 * dt * F_indist
 
     def get_kins(self):
         """Gets the MD kinetic energy for all the normal modes.
